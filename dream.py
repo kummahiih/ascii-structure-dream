@@ -131,7 +131,11 @@ def batch_perplexity(model, tokenizer, texts, device, max_len=96):
 
 
 def sample_windows(text, n, length):
+    text = text.strip()
+    if not text:
+        return [" "] * n
     if len(text) <= length:
+        # whole grid is smaller than the window — just use it
         return [text] * n
     starts = [random.randrange(0, len(text) - length) for _ in range(n)]
     return [text[s:s + length] for s in starts]
@@ -175,9 +179,13 @@ def main():
         torch.manual_seed(args.seed)
 
     w = args.size
-    h = args.height if args.height is not None else max(16, w // 2)
-    if args.size >= 200 and args.height is None:
-        h = min(args.size, 80)  # keep height reasonable unless forced
+    h = args.height if args.height is not None else args.size
+    # for very small tests keep it square and short windows
+    if w <= 20:
+        args.window_len = min(args.window_len, max(16, w * h // 2))
+        args.windows = min(args.windows, 2)
+        args.score_every = 1
+        args.mut = min(args.mut, 3)
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     print(f"Device: {device}  model={args.model}  windows={args.windows}  score_every={args.score_every}",

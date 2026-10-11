@@ -4,7 +4,13 @@ Deep Dream-like process on a grid of random ASCII characters, scored by a **lang
 
 Mutations are accepted when they lower the LM’s perplexity on short windows (the text becomes more probable under the model).
 
-## Faster defaults
+## Quick 10×10 test
+
+```bash
+python dream.py --size 10
+```
+
+For grids ≤20 the script automatically uses the whole text (or a short window), scores every step, and mutates only a few cells so you can watch the small pattern change.
 
 The script now defaults to **gpt2** (~124M) and includes speed knobs:
 
