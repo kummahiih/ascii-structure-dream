@@ -73,7 +73,7 @@ def display(grid, accepted, score, elapsed, proposals, crop=None):
     for row in view:
         print("".join(row))
     print("─" * min(len(view[0]) if view else 0, 140))
-    print("Accepted only on lower perplexity. Ctrl-C to stop.")
+    print("Accepted on lower perplexity (soft on ≤20 grids). Ctrl-C to stop.")
 
 
 def load_model(name, device, use_4bit):
@@ -210,20 +210,22 @@ def main():
 
     try:
         while args.steps == 0 or proposals < args.steps:
-            if proposals % args.score_every == 0 or proposals == 0:
+            if proposals % max(1, args.score_every) == 0 or proposals == 0 or w <= 20:
                 display(grid, accepted, current_score, time.time() - start, proposals,
                         crop=(term_w, term_h) if (w > term_w or h > term_h) else None)
 
             cand = mutate(grid, args.mut)
-            # Only fully score when it's time; otherwise accept randomly with low prob or skip
             if proposals % args.score_every == 0:
                 score_cand = score_grid(model, tokenizer, cand, args.windows, args.window_len, device)
-                if score_cand < current_score:
+                improved = score_cand < current_score
+                # on tiny grids the landscape is almost flat — allow soft acceptance
+                soft = (w <= 20) and (random.random() < 0.4 or improved)
+                if improved or soft:
                     grid = cand
-                    current_score = score_cand
+                    if math.isfinite(score_cand):
+                        current_score = score_cand
                     accepted += 1
             else:
-                # cheap path: accept a fraction of the time to keep motion
                 if random.random() < 0.15:
                     grid = cand
                     accepted += 1
