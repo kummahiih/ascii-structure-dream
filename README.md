@@ -1,53 +1,31 @@
 # ASCII Structure Dream
 
-Deep Dream-like process on a grid of random ASCII characters, scored by a **language model**.
+Fast Deep Dream-like process on a grid of random letters.
 
-Mutations are accepted when they lower the LM’s perplexity on short windows (the text becomes more probable under the model).
+A character n-gram model (English letter / bigram / trigram statistics) scores the grid.  
+Mutations are accepted when they raise the score — i.e. when the text starts looking more like English letter sequences.
 
-## Quick 10×10 test
+No transformers, no GPU required. Fast enough to watch live even on larger grids.
+
+## Run
 
 ```bash
+# 10×10 test
 python dream.py --size 10
+
+# medium
+python dream.py --size 40
+
+# bigger
+python dream.py --size 80 --mut 15
 ```
 
-For grids ≤20 the script automatically uses the whole text (or a short window), scores every step, and mutates only a few cells so you can watch the small pattern change.
+Ctrl-C to stop.
 
-The script now defaults to **gpt2** (~124M) and includes speed knobs:
+## What you should see
 
-```bash
-# fastest interactive
-python dream.py --fast
+Short English-like fragments (`the`, `and`, `ing`, `er`, …) gradually appear and spread because those n-grams raise the score. It is not a full language model, but it is fast enough that the terminal actually updates and structure becomes visible.
 
-# still LM, but quicker
-python dream.py --model gpt2 --windows 2 --score-every 4 --size 60
+## Why the change
 
-# larger model when you want more sensitivity (slower)
-python dream.py --model Qwen/Qwen2.5-1.5B --size 48 --windows 3
-```
-
-`--fast` reduces windows, shortens them, and only scores every 4 proposals (other proposals are accepted with low probability to keep the grid moving).
-
-## Requirements
-
-```bash
-pip install -r requirements.txt
-```
-
-4-bit is used automatically on CUDA for larger models.
-
-## Full 500×500
-
-```bash
-python dream.py --size 500 --fast
-```
-
-Display center-crops to the terminal. Scoring stays on short windows so context length is never the limit.
-
-## GPU
-
-12 GB 4070 Ti easily runs gpt2, 1.5B, and 7B/8B in 4-bit. Smaller models are recommended for live watching.
-
-## Related
-
-- [regret-heuristic](https://github.com/kummahiih/regret-heuristic)
-- [intent-readout-search](https://github.com/kummahiih/intent-readout-search)
+Full LM scoring in Python was too slow for anything beyond tiny grids, so the display froze. This version evaluates a whole grid in milliseconds.

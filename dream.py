@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-ASCII Structure Dream — language-model version (faster)
+ASCII Structure Dream — fast n-gram version
 
-Mutations are accepted when they lower the LM's perplexity on short windows.
-Optimizations vs previous version:
-- tiny default model
-- batched scoring
-- score only every N proposals (or on a schedule)
-- optional "fast" mode that scores fewer / shorter windows
-- early exit on clear improvements
+Deep Dream-like process on a grid of random letters.
+A character n-gram model (English letter statistics) scores the grid.
+Mutations are accepted when they raise the n-gram likelihood
+(i.e. the text starts looking more like English letter sequences).
+
+Fast enough to watch even on larger grids. No transformers required.
 
 Usage:
-    python dream.py                     # fast defaults
-    python dream.py --size 500 --fast
-    python dream.py --model gpt2 --windows 2 --score-every 3
+    python dream.py                  # 40x20
+    python dream.py --size 10
+    python dream.py --size 80 --mut 20
 """
 
 import argparse
@@ -23,16 +22,43 @@ import time
 import random
 import string
 import math
+from collections import Counter
 
-try:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-except ImportError:
-    print("Missing dependencies. Run: pip install -r requirements.txt", file=sys.stderr)
-    sys.exit(1)
+# English letter + space unigram / bigram / trigram counts
+# (approximate, derived from common English text statistics)
+ENGLISH_UNI = {
+    ' ': 0.18, 'e': 0.12, 't': 0.09, 'a': 0.08, 'o': 0.075, 'i': 0.07,
+    'n': 0.067, 's': 0.063, 'h': 0.061, 'r': 0.060, 'd': 0.043, 'l': 0.040,
+    'c': 0.028, 'u': 0.028, 'm': 0.024, 'w': 0.024, 'f': 0.022, 'g': 0.020,
+    'y': 0.020, 'p': 0.019, 'b': 0.015, 'v': 0.010, 'k': 0.008, 'j': 0.0015,
+    'x': 0.0015, 'q': 0.001, 'z': 0.0007,
+}
+# a few strong English bigrams (log-prob bonuses)
+ENGLISH_BI = {
+    'th': 2.5, 'he': 2.2, 'in': 1.8, 'er': 1.7, 'an': 1.6, 're': 1.5,
+    'on': 1.4, 'at': 1.3, 'en': 1.3, 'nd': 1.2, 'ti': 1.2, 'es': 1.2,
+    'or': 1.1, 'te': 1.1, 'of': 1.1, 'ed': 1.0, 'is': 1.0, 'it': 1.0,
+    'al': 1.0, 'ar': 0.9, 'st': 0.9, 'to': 0.9, 'nt': 0.9, 'ng': 0.8,
+    'se': 0.8, 'ha': 0.8, 'as': 0.7, 'ou': 0.7, 'io': 0.7, 'le': 0.7,
+    've': 0.6, 'co': 0.6, 'me': 0.6, 'de': 0.6, 'hi': 0.6, 'ri': 0.6,
+    'ro': 0.5, 'ic': 0.5, 'ne': 0.5, 'ea': 0.5, 'ra': 0.5, 'ce': 0.5,
+    'li': 0.5, 'ch': 0.5, 'll': 0.4, 'be': 0.4, 'ma': 0.4, 'si': 0.4,
+    'om': 0.4, 'ur': 0.4,
+}
+# strong English trigrams
+ENGLISH_TRI = {
+    'the': 3.0, 'and': 2.5, 'ing': 2.2, 'her': 1.8, 'hat': 1.6, 'his': 1.5,
+    'tha': 1.5, 'ere': 1.4, 'for': 1.4, 'ent': 1.3, 'ion': 1.3, 'ter': 1.2,
+    'was': 1.2, 'you': 1.2, 'ith': 1.1, 'ver': 1.1, 'all': 1.0, 'wit': 1.0,
+    'thi': 1.0, 'tio': 1.0,
+}
 
-# Letters + space only — so words can actually form
 CHARS = string.ascii_lowercase + " "
+# precompute log unigram
+LOG_UNI = {c: math.log(p + 1e-6) for c, p in ENGLISH_UNI.items()}
+for c in CHARS:
+    if c not in LOG_UNI:
+        LOG_UNI[c] = math.log(1e-4)
 
 
 def random_grid(h, w):
@@ -40,16 +66,15 @@ def random_grid(h, w):
 
 
 def mutate(grid, n_mut):
-    """Change random cells. Bias a bit toward letters (already the only chars)."""
     h, w = len(grid), len(grid[0])
     new = [row[:] for row in grid]
     for _ in range(n_mut):
         y = random.randrange(h)
         x = random.randrange(w)
-        # occasionally insert a short random letter run to seed words
-        if random.random() < 0.15 and x + 3 < w:
-            wordish = "".join(random.choice(string.ascii_lowercase) for _ in range(random.randint(2, 4)))
-            for i, c in enumerate(wordish):
+        if random.random() < 0.25 and x + 2 < w:
+            # seed a short common English fragment
+            frag = random.choice(["the", "and", "ing", "er ", "th", "he", "in", "on", "at", "to"])
+            for i, c in enumerate(frag):
                 if x + i < w:
                     new[y][x + i] = c
         else:
@@ -57,161 +82,58 @@ def mutate(grid, n_mut):
     return new
 
 
-def grid_to_text(grid):
-    return "\n".join("".join(row) for row in grid)
+def score_grid(grid):
+    """Higher is better (log-likelihood under English n-grams)."""
+    s = 0.0
+    h, w = len(grid), len(grid[0])
+    for y in range(h):
+        row = grid[y]
+        for x in range(w):
+            c = row[x]
+            s += LOG_UNI.get(c, -8.0)
+            if x + 1 < w:
+                bi = c + row[x + 1]
+                s += ENGLISH_BI.get(bi, 0.0)
+            if x + 2 < w:
+                tri = c + row[x + 1] + row[x + 2]
+                s += ENGLISH_TRI.get(tri, 0.0)
+    return s / (h * w)  # average per cell so size doesn't dominate
 
 
 def clear_screen():
     print("\033[2J\033[H", end="")
 
 
-def display(grid, accepted, score, elapsed, proposals, crop=None):
-    h, w = len(grid), len(grid[0])
-    if crop and (w > crop[0] or h > crop[1]):
-        cw, ch = crop
-        x0 = max(0, (w - cw) // 2)
-        y0 = max(0, (h - ch) // 2)
-        view = [row[x0:x0 + cw] for row in grid[y0:y0 + ch]]
-        label = f" [crop {cw}x{ch} of {w}x{h}]"
-    else:
-        view = grid
-        label = ""
+def display(grid, accepted, score, elapsed, proposals):
     clear_screen()
-    print(f"ASCII LM Dream  acc={accepted:4d}/{proposals:<4d}  ppl={score:.1f}  t={elapsed:.1f}s{label}")
-    print("─" * min(len(view[0]) if view else 0, 140))
-    for row in view:
+    print(f"ASCII n-gram Dream  acc={accepted:4d}/{proposals:<4d}  score={score:.3f}  t={elapsed:.1f}s")
+    print("─" * len(grid[0]))
+    for row in grid:
         print("".join(row))
-    print("─" * min(len(view[0]) if view else 0, 140))
-    print("Letters+space only. Accepted when perplexity falls (soft explore on small grids). Ctrl-C to stop.")
-
-
-def load_model(name, device, use_4bit):
-    print(f"Loading {name} ...", file=sys.stderr)
-    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    kwargs = {"trust_remote_code": True}
-    if use_4bit and device.type == "cuda":
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        kwargs["quantization_config"] = bnb
-        kwargs["device_map"] = "auto"
-    else:
-        kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
-
-    model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
-    model.eval()
-    if device.type == "cuda" and not use_4bit:
-        model = model.to(device)
-    return model, tokenizer
-
-
-@torch.no_grad()
-def batch_perplexity(model, tokenizer, texts, device, max_len=96):
-    """Mean perplexity over a batch of short strings. Returns list of ppls."""
-    if not texts:
-        return []
-    # filter empty
-    texts = [t if t.strip() else " " for t in texts]
-    try:
-        enc = tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_len,
-        )
-        enc = {k: v.to(model.device) for k, v in enc.items()}
-        if enc["input_ids"].size(1) < 2:
-            return [float("inf")] * len(texts)
-        out = model(**enc, labels=enc["input_ids"])
-        # approximate per-example loss via token-level (simple mean for speed)
-        # For true per-seq we'd need more work; this is a fast proxy
-        loss = out.loss.item()
-        ppl = math.exp(loss)
-        return [ppl] * len(texts)  # same proxy score for the batch (fast)
-    except Exception:
-        return [float("inf")] * len(texts)
-
-
-def sample_windows(text, n, length):
-    text = text.strip()
-    if not text:
-        return [" "] * n
-    if len(text) <= length:
-        # whole grid is smaller than the window — just use it
-        return [text] * n
-    starts = [random.randrange(0, len(text) - length) for _ in range(n)]
-    return [text[s:s + length] for s in starts]
-
-
-def score_grid(model, tokenizer, grid, n_windows, window_len, device):
-    text = grid_to_text(grid)
-    windows = sample_windows(text, n_windows, window_len)
-    ppls = batch_perplexity(model, tokenizer, windows, device, max_len=window_len)
-    valid = [p for p in ppls if math.isfinite(p)]
-    return sum(valid) / len(valid) if valid else float("inf")
+    print("─" * len(grid[0]))
+    print("Letters+space. Higher score = more English-like. Ctrl-C to stop.")
 
 
 def main():
-    p = argparse.ArgumentParser(description="ASCII Structure Dream (faster LM version)")
-    p.add_argument("--size", type=int, default=48, help="Grid width")
+    p = argparse.ArgumentParser(description="ASCII Structure Dream (fast n-gram)")
+    p.add_argument("--size", type=int, default=40, help="Grid width")
     p.add_argument("--height", type=int, default=None)
-    p.add_argument("--model", type=str, default="gpt2",
-                   help="HF model. gpt2 (~124M) is the fast default; Qwen2.5-1.5B etc. also work")
-    p.add_argument("--windows", type=int, default=3, help="Windows scored per evaluation")
-    p.add_argument("--window-len", type=int, default=64, help="Chars per window")
-    p.add_argument("--score-every", type=int, default=1,
-                   help="Only score every N proposals (higher = faster, coarser)")
     p.add_argument("--steps", type=int, default=0, help="Max proposals (0=forever)")
-    p.add_argument("--mut", type=int, default=8, help="Mutations per proposal")
-    p.add_argument("--fast", action="store_true",
-                   help="Aggressive speed: fewer windows, shorter, score less often")
-    p.add_argument("--no-4bit", action="store_true")
-    p.add_argument("--cpu", action="store_true")
+    p.add_argument("--mut", type=int, default=6, help="Mutations per proposal")
     p.add_argument("--seed", type=int, default=None)
     args = p.parse_args()
 
-    if args.fast:
-        args.windows = min(args.windows, 2)
-        args.window_len = min(args.window_len, 48)
-        args.score_every = max(args.score_every, 4)
-        args.mut = max(args.mut, 6)
-
     if args.seed is not None:
         random.seed(args.seed)
-        torch.manual_seed(args.seed)
 
     w = args.size
-    h = args.height if args.height is not None else args.size
-    # for very small tests keep it square and short windows
+    h = args.height if args.height is not None else max(8, w // 2)
     if w <= 20:
-        args.window_len = min(args.window_len, max(20, w * h))
-        args.windows = min(args.windows, 2)
-        args.score_every = 1
-        args.mut = max(2, min(args.mut, 5))
-
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    print(f"Device: {device}  model={args.model}  windows={args.windows}  score_every={args.score_every}",
-          file=sys.stderr)
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}", file=sys.stderr)
-
-    model, tokenizer = load_model(args.model, device, use_4bit=not args.no_4bit and device.type == "cuda")
+        h = w
+        args.mut = max(1, min(args.mut, 3))
 
     grid = random_grid(h, w)
-    current_score = score_grid(model, tokenizer, grid, args.windows, args.window_len, device)
-
-    try:
-        term_w = min(os.get_terminal_size().columns - 2, 140)
-        term_h = min(os.get_terminal_size().lines - 6, 36)
-    except Exception:
-        term_w, term_h = 100, 28
+    current = score_grid(grid)
 
     start = time.time()
     proposals = 0
@@ -219,32 +141,23 @@ def main():
 
     try:
         while args.steps == 0 or proposals < args.steps:
-            if proposals % max(1, args.score_every) == 0 or proposals == 0 or w <= 20:
-                display(grid, accepted, current_score, time.time() - start, proposals,
-                        crop=(term_w, term_h) if (w > term_w or h > term_h) else None)
+            display(grid, accepted, current, time.time() - start, proposals)
 
             cand = mutate(grid, args.mut)
-            if proposals % args.score_every == 0:
-                score_cand = score_grid(model, tokenizer, cand, args.windows, args.window_len, device)
-                # always take improvements; on small grids also take mild worsenings so it can explore
-                delta = score_cand - current_score
-                take = delta < 0 or (w <= 20 and random.random() < math.exp(-max(0, delta) / 8.0))
-                if take and math.isfinite(score_cand):
-                    grid = cand
-                    current_score = score_cand
-                    accepted += 1
-            else:
-                if random.random() < 0.1:
-                    grid = cand
-                    accepted += 1
+            sc = score_grid(cand)
+            # accept improvement; tiny chance of equal/worse so it doesn't freeze
+            if sc > current or random.random() < 0.02:
+                grid = cand
+                current = sc
+                accepted += 1
 
             proposals += 1
-            if proposals % 20 == 0:
-                time.sleep(0.01)
+            # yield so the terminal can refresh and Ctrl-C works
+            time.sleep(0.03)
 
     except KeyboardInterrupt:
         print("\nStopped.")
-        print(f"Accepted {accepted} / {proposals} proposals. Last ppl: {current_score:.1f}")
+        print(f"Accepted {accepted} / {proposals} proposals. Final score: {current:.3f}")
 
 
 if __name__ == "__main__":
