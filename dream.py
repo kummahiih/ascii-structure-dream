@@ -31,7 +31,8 @@ except ImportError:
     print("Missing dependencies. Run: pip install -r requirements.txt", file=sys.stderr)
     sys.exit(1)
 
-CHARS = "".join(c for c in string.printable if 32 <= ord(c) <= 126)
+# Letters + space only — so words can actually form
+CHARS = string.ascii_lowercase + " "
 
 
 def random_grid(h, w):
@@ -39,12 +40,20 @@ def random_grid(h, w):
 
 
 def mutate(grid, n_mut):
+    """Change random cells. Bias a bit toward letters (already the only chars)."""
     h, w = len(grid), len(grid[0])
     new = [row[:] for row in grid]
     for _ in range(n_mut):
         y = random.randrange(h)
         x = random.randrange(w)
-        new[y][x] = random.choice(CHARS)
+        # occasionally insert a short random letter run to seed words
+        if random.random() < 0.15 and x + 3 < w:
+            wordish = "".join(random.choice(string.ascii_lowercase) for _ in range(random.randint(2, 4)))
+            for i, c in enumerate(wordish):
+                if x + i < w:
+                    new[y][x + i] = c
+        else:
+            new[y][x] = random.choice(CHARS)
     return new
 
 
@@ -73,7 +82,7 @@ def display(grid, accepted, score, elapsed, proposals, crop=None):
     for row in view:
         print("".join(row))
     print("─" * min(len(view[0]) if view else 0, 140))
-    print("Accepted on lower perplexity (soft on ≤20 grids). Ctrl-C to stop.")
+    print("Letters+space only. Accepted when perplexity falls (soft explore on small grids). Ctrl-C to stop.")
 
 
 def load_model(name, device, use_4bit):
@@ -182,10 +191,10 @@ def main():
     h = args.height if args.height is not None else args.size
     # for very small tests keep it square and short windows
     if w <= 20:
-        args.window_len = min(args.window_len, max(16, w * h // 2))
+        args.window_len = min(args.window_len, max(20, w * h))
         args.windows = min(args.windows, 2)
         args.score_every = 1
-        args.mut = min(args.mut, 3)
+        args.mut = max(2, min(args.mut, 5))
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     print(f"Device: {device}  model={args.model}  windows={args.windows}  score_every={args.score_every}",
@@ -217,16 +226,15 @@ def main():
             cand = mutate(grid, args.mut)
             if proposals % args.score_every == 0:
                 score_cand = score_grid(model, tokenizer, cand, args.windows, args.window_len, device)
-                improved = score_cand < current_score
-                # on tiny grids the landscape is almost flat — allow soft acceptance
-                soft = (w <= 20) and (random.random() < 0.4 or improved)
-                if improved or soft:
+                # always take improvements; on small grids also take mild worsenings so it can explore
+                delta = score_cand - current_score
+                take = delta < 0 or (w <= 20 and random.random() < math.exp(-max(0, delta) / 8.0))
+                if take and math.isfinite(score_cand):
                     grid = cand
-                    if math.isfinite(score_cand):
-                        current_score = score_cand
+                    current_score = score_cand
                     accepted += 1
             else:
-                if random.random() < 0.15:
+                if random.random() < 0.1:
                     grid = cand
                     accepted += 1
 
