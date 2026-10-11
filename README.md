@@ -1,56 +1,53 @@
 # ASCII Structure Dream
 
-Deep Dream-like evolutionary process on a grid of random ASCII characters.
+Deep Dream-like process on a grid of random ASCII characters, scored by a **language model**.
 
-A small randomly-initialized CNN scores "structure" (magnitude of intermediate feature maps).  
-Random mutations are proposed; they are accepted only when the structure score rises.  
-The grid slowly organizes into whatever patterns the frozen network finds salient.
+A causal LM (default Qwen2.5-1.5B, or any model that fits your 12 GB 4070 Ti in 4-bit) evaluates short windows of the grid by perplexity. Random mutations are accepted only when they lower the average perplexity — i.e. when the random text starts looking more like sequences the model assigns probability to.
 
-Watch it evolve live in the terminal.
+Watch it evolve in the terminal.
 
 ## Requirements
-
-- Python 3.8+
-- PyTorch (CPU is fine; CUDA used automatically if available)
-- ~12 GB VRAM is more than enough for any size here
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Works on CPU; uses CUDA + 4-bit automatically when a GPU is present.
+
 ## Run
 
 ```bash
-# Terminal-friendly default (80×40)
+# Small & fast (default model Qwen2.5-1.5B)
 python dream.py
 
-# The requested 500×500 (display will center-crop to your terminal size)
+# The 500×500 grid (display center-crops to terminal)
 python dream.py --size 500
 
-# Longer run, more mutations per step
-python dream.py --size 120 --steps 2000 --mut 40
+# Use a model you already have locally, or a 7B/8B that fits in 4-bit
+python dream.py --model Qwen/Qwen2.5-7B-Instruct --size 80 --windows 4 --mut 8
 
-# Force CPU
-python dream.py --cpu
+# Gemma-3-4B, Granite, etc. also work
+python dream.py --model google/gemma-2-2b
 ```
 
-Ctrl-C to stop. The process prints the current grid (or a center crop when the grid is larger than the terminal) after each accepted mutation.
+Ctrl-C to stop.
 
 ## How it works
 
-1. Start with a uniform random printable-ASCII grid.
-2. A small 3-layer CNN (fixed random weights) evaluates a structure score = mean squared activation of the feature maps.
-3. Propose `N` random cell changes.
-4. Accept the proposal only if the score increases.
-5. Repeat. Over time local patterns the network responds to are reinforced.
+1. Random printable-ASCII grid.
+2. Draw several random windows (default 128 chars).
+3. Score each window with the LM’s perplexity.
+4. Propose random cell mutations.
+5. Accept only if mean perplexity falls.
+6. Redraw (or center-crop) so you can watch structure emerge.
 
-This is a discrete, mutation-based cousin of the original DeepDream gradient-ascent procedure.
+Because full 500×500 text far exceeds any context window, scoring is always done on short windows. Larger models are slower but can be more sensitive to longer-range patterns.
 
-## GPU note
+## GPU
 
-The code checks `torch.cuda.is_available()` and moves the model and tensors to GPU when present.  
-Your 12 GB card easily handles a 500×500 single-channel grid and this tiny network.
+Your 12 GB 4070 Ti is enough for 7B–8B models in 4-bit (the same class used in [intent-readout-search](https://github.com/kummahiih/intent-readout-search)). The script loads with bitsandbytes 4-bit by default.
 
 ## Related
 
-Part of the broader experimental line that includes [regret-heuristic](https://github.com/kummahiih/regret-heuristic) and [intent-readout-search](https://github.com/kummahiih/intent-readout-search).
+- [regret-heuristic](https://github.com/kummahiih/regret-heuristic)
+- [intent-readout-search](https://github.com/kummahiih/intent-readout-search)

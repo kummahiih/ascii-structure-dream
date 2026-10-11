@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-ASCII Structure Dream
+ASCII Structure Dream — language-model version
 
-Deep Dream-like process on a grid of ASCII characters.
-Starts from random printable ASCII. A small CNN scores "structure"
-(activation magnitude of intermediate feature maps). Random mutations
-are accepted only when they increase the structure score.
+Deep Dream-like process on a grid of random ASCII characters.
+A causal language model scores local windows of the grid by perplexity.
+Random mutations are accepted only when they lower the average perplexity
+(i.e. the text starts looking more like something the model assigns probability to).
 
-Watch it evolve in the terminal.
+Designed for a 12 GB GPU (4-bit load). 500×500 is supported; scoring is done
+on short sliding windows so context length is never exceeded.
 
 Usage:
-    python dream.py                  # 80x40, good for terminal
-    python dream.py --size 500       # full 500x500 (display crops to terminal)
-    python dream.py --size 200 --steps 1000 --mut 50
+    python dream.py
+    python dream.py --size 500 --model Qwen/Qwen2.5-1.5B
+    python dream.py --model google/gemma-2-2b --windows 8 --mut 15
 """
 
 import argparse
@@ -21,61 +22,16 @@ import sys
 import time
 import random
 import string
+import math
 
 try:
     import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    TORCH = True
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 except ImportError:
-    TORCH = False
-    print("PyTorch not found. Install with: pip install torch", file=sys.stderr)
+    print("Missing dependencies. Run: pip install -r requirements.txt", file=sys.stderr)
     sys.exit(1)
 
-# Printable ASCII excluding control chars. Space to ~
-CHARS = string.printable.strip()
-# Prefer denser set for visual interest
 CHARS = "".join(c for c in string.printable if 32 <= ord(c) <= 126)
-N_CHARS = len(CHARS)
-CHAR_TO_IDX = {c: i for i, c in enumerate(CHARS)}
-
-
-def grid_to_tensor(grid, device):
-    """Convert list-of-lists of chars to (1, 1, H, W) float tensor in [0, 1]."""
-    h, w = len(grid), len(grid[0])
-    t = torch.zeros(1, 1, h, w, device=device)
-    for y in range(h):
-        for x in range(w):
-            t[0, 0, y, x] = ord(grid[y][x]) / 127.0
-    return t
-
-
-class StructureNet(nn.Module):
-    """Small CNN whose intermediate activations define 'structure'."""
-
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 16, 3, padding=1)
-        # Fixed random weights — the "dream" is what this particular net finds interesting
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        return x
-
-    def structure_score(self, x):
-        """Higher when intermediate maps have strong local patterns."""
-        with torch.no_grad():
-            feat = self.forward(x)
-            # L2 norm of features + local variance encouragement
-            return feat.pow(2).mean().item()
 
 
 def random_grid(h, w):
@@ -83,7 +39,6 @@ def random_grid(h, w):
 
 
 def mutate(grid, n_mut):
-    """Return a new grid with n_mut random cell changes."""
     h, w = len(grid), len(grid[0])
     new = [row[:] for row in grid]
     for _ in range(n_mut):
@@ -93,16 +48,17 @@ def mutate(grid, n_mut):
     return new
 
 
+def grid_to_lines(grid):
+    return ["".join(row) for row in grid]
+
+
 def clear_screen():
-    # ANSI clear + home
     print("\033[2J\033[H", end="")
 
 
 def display(grid, step, score, elapsed, crop=None):
-    """Print grid (or center crop) to terminal."""
     h, w = len(grid), len(grid[0])
     if crop and (w > crop[0] or h > crop[1]):
-        # center crop
         cw, ch = crop
         x0 = max(0, (w - cw) // 2)
         y0 = max(0, (h - ch) // 2)
@@ -112,23 +68,86 @@ def display(grid, step, score, elapsed, crop=None):
         view = grid
         label = ""
     clear_screen()
-    print(f"ASCII Structure Dream  step={step:5d}  score={score:.5f}  time={elapsed:.1f}s{label}")
-    print("─" * min(len(view[0]) if view else 0, 120))
+    print(f"ASCII LM Dream  accepted={step:5d}  ppl={score:.2f}  time={elapsed:.1f}s{label}")
+    print("─" * min(len(view[0]) if view else 0, 140))
     for row in view:
         print("".join(row))
-    print("─" * min(len(view[0]) if view else 0, 120))
-    print("Ctrl-C to stop. Mutations accepted only when structure score rises.")
+    print("─" * min(len(view[0]) if view else 0, 140))
+    print("Mutations accepted only when language-model perplexity falls. Ctrl-C to stop.")
+
+
+def load_model(name, device, use_4bit):
+    print(f"Loading {name} ...", file=sys.stderr)
+    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    kwargs = {"trust_remote_code": True}
+    if use_4bit and device.type == "cuda":
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        kwargs["quantization_config"] = bnb
+        kwargs["device_map"] = "auto"
+    else:
+        kwargs["torch_dtype"] = torch.float16 if device.type == "cuda" else torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    model.eval()
+    if device.type == "cuda" and not use_4bit:
+        model = model.to(device)
+    return model, tokenizer
+
+
+@torch.no_grad()
+def window_perplexity(model, tokenizer, text, device):
+    """Average token perplexity of a short string. Returns inf on failure."""
+    if not text.strip():
+        return float("inf")
+    try:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        if inputs["input_ids"].size(1) < 2:
+            return float("inf")
+        out = model(**inputs, labels=inputs["input_ids"])
+        return math.exp(out.loss.item())
+    except Exception:
+        return float("inf")
+
+
+def score_grid(model, tokenizer, grid, n_windows, window_len, device):
+    """Mean perplexity over random windows drawn from the grid."""
+    lines = grid_to_lines(grid)
+    full = "\n".join(lines)
+    if len(full) < window_len + 1:
+        return window_perplexity(model, tokenizer, full, device)
+
+    scores = []
+    for _ in range(n_windows):
+        start = random.randrange(0, max(1, len(full) - window_len))
+        chunk = full[start:start + window_len]
+        scores.append(window_perplexity(model, tokenizer, chunk, device))
+    valid = [s for s in scores if math.isfinite(s)]
+    return sum(valid) / len(valid) if valid else float("inf")
 
 
 def main():
-    p = argparse.ArgumentParser(description="ASCII Structure Dream")
-    p.add_argument("--size", type=int, default=80, help="Grid side length (default 80; use 500 for full request)")
-    p.add_argument("--height", type=int, default=None, help="Override height (default = size//2 or size)")
-    p.add_argument("--steps", type=int, default=0, help="Max steps (0 = run forever)")
-    p.add_argument("--mut", type=int, default=20, help="Mutations per proposal")
-    p.add_argument("--display-every", type=int, default=1, help="Redraw every N accepted steps")
+    p = argparse.ArgumentParser(description="ASCII Structure Dream (language model)")
+    p.add_argument("--size", type=int, default=60, help="Grid width (height defaults to size//2 or size)")
+    p.add_argument("--height", type=int, default=None)
+    p.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B",
+                   help="HF model id. Small models are faster; 7B/8B work in 4-bit on 12GB")
+    p.add_argument("--windows", type=int, default=6, help="Number of random windows scored per proposal")
+    p.add_argument("--window-len", type=int, default=128, help="Characters per scoring window")
+    p.add_argument("--steps", type=int, default=0, help="Max proposals (0 = forever)")
+    p.add_argument("--mut", type=int, default=12, help="Random cell changes per proposal")
+    p.add_argument("--display-every", type=int, default=1)
+    p.add_argument("--no-4bit", action="store_true", help="Disable 4-bit quantization")
+    p.add_argument("--cpu", action="store_true")
     p.add_argument("--seed", type=int, default=None)
-    p.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA available")
     args = p.parse_args()
 
     if args.seed is not None:
@@ -136,62 +155,53 @@ def main():
         torch.manual_seed(args.seed)
 
     w = args.size
-    h = args.height if args.height else (args.size if args.size <= 120 else args.size // 2)
-    # For 500 request: square 500x500 is extreme for terminal; default height smaller unless forced
-    if args.size == 500 and args.height is None:
-        h = 500  # honor the request; display will crop
+    h = args.height if args.height is not None else (w if w <= 100 else max(30, w // 4))
+    if args.size >= 500 and args.height is None:
+        h = 500
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     print(f"Device: {device}", file=sys.stderr)
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}", file=sys.stderr)
 
-    net = StructureNet().to(device).eval()
+    model, tokenizer = load_model(args.model, device, use_4bit=not args.no_4bit)
+
     grid = random_grid(h, w)
 
-    # Terminal crop for display when grid is huge
-    term_w = 120
-    term_h = 40
     try:
-        # rough terminal size
-        term_w = min(os.get_terminal_size().columns - 2, 160)
-        term_h = min(os.get_terminal_size().lines - 6, 50)
+        term_w = min(os.get_terminal_size().columns - 2, 140)
+        term_h = min(os.get_terminal_size().lines - 6, 40)
     except Exception:
-        pass
+        term_w, term_h = 100, 30
 
     start = time.time()
-    step = 0
+    proposals = 0
     accepted = 0
-    score = 0.0
+    best = float("inf")
 
     try:
-        while args.steps == 0 or step < args.steps:
-            # Evaluate current
-            t = grid_to_tensor(grid, device)
-            score = net.structure_score(t)
+        while args.steps == 0 or proposals < args.steps:
+            score = score_grid(model, tokenizer, grid, args.windows, args.window_len, device)
+            best = min(best, score)
 
-            if step % args.display_every == 0 or accepted == 0:
+            if accepted % args.display_every == 0 or proposals == 0:
                 display(grid, accepted, score, time.time() - start,
                         crop=(term_w, term_h) if (w > term_w or h > term_h) else None)
 
-            # Propose mutation
             cand = mutate(grid, args.mut)
-            t_cand = grid_to_tensor(cand, device)
-            score_cand = net.structure_score(t_cand)
+            score_cand = score_grid(model, tokenizer, cand, args.windows, args.window_len, device)
 
-            if score_cand > score:
+            if score_cand < score:
                 grid = cand
-                score = score_cand
                 accepted += 1
 
-            step += 1
-            # small yield so Ctrl-C is responsive
-            if step % 10 == 0:
-                time.sleep(0.01)
+            proposals += 1
+            if proposals % 5 == 0:
+                time.sleep(0.02)
 
     except KeyboardInterrupt:
-        print("\nStopped by user.")
-        print(f"Accepted {accepted} mutations in {step} proposals. Final score: {score:.5f}")
+        print("\nStopped.")
+        print(f"Accepted {accepted} / {proposals} proposals. Best perplexity seen: {best:.2f}")
 
 
 if __name__ == "__main__":
