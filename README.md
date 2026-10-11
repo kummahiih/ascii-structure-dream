@@ -2,9 +2,24 @@
 
 Deep Dream-like process on a grid of random ASCII characters, scored by a **language model**.
 
-A causal LM (default Qwen2.5-1.5B, or any model that fits your 12 GB 4070 Ti in 4-bit) evaluates short windows of the grid by perplexity. Random mutations are accepted only when they lower the average perplexity — i.e. when the random text starts looking more like sequences the model assigns probability to.
+Mutations are accepted when they lower the LM’s perplexity on short windows (the text becomes more probable under the model).
 
-Watch it evolve in the terminal.
+## Faster defaults
+
+The script now defaults to **gpt2** (~124M) and includes speed knobs:
+
+```bash
+# fastest interactive
+python dream.py --fast
+
+# still LM, but quicker
+python dream.py --model gpt2 --windows 2 --score-every 4 --size 60
+
+# larger model when you want more sensitivity (slower)
+python dream.py --model Qwen/Qwen2.5-1.5B --size 48 --windows 3
+```
+
+`--fast` reduces windows, shortens them, and only scores every 4 proposals (other proposals are accepted with low probability to keep the grid moving).
 
 ## Requirements
 
@@ -12,40 +27,19 @@ Watch it evolve in the terminal.
 pip install -r requirements.txt
 ```
 
-Works on CPU; uses CUDA + 4-bit automatically when a GPU is present.
+4-bit is used automatically on CUDA for larger models.
 
-## Run
+## Full 500×500
 
 ```bash
-# Small & fast (default model Qwen2.5-1.5B)
-python dream.py
-
-# The 500×500 grid (display center-crops to terminal)
-python dream.py --size 500
-
-# Use a model you already have locally, or a 7B/8B that fits in 4-bit
-python dream.py --model Qwen/Qwen2.5-7B-Instruct --size 80 --windows 4 --mut 8
-
-# Gemma-3-4B, Granite, etc. also work
-python dream.py --model google/gemma-2-2b
+python dream.py --size 500 --fast
 ```
 
-Ctrl-C to stop.
-
-## How it works
-
-1. Random printable-ASCII grid.
-2. Draw several random windows (default 128 chars).
-3. Score each window with the LM’s perplexity.
-4. Propose random cell mutations.
-5. Accept only if mean perplexity falls.
-6. Redraw (or center-crop) so you can watch structure emerge.
-
-Because full 500×500 text far exceeds any context window, scoring is always done on short windows. Larger models are slower but can be more sensitive to longer-range patterns.
+Display center-crops to the terminal. Scoring stays on short windows so context length is never the limit.
 
 ## GPU
 
-Your 12 GB 4070 Ti is enough for 7B–8B models in 4-bit (the same class used in [intent-readout-search](https://github.com/kummahiih/intent-readout-search)). The script loads with bitsandbytes 4-bit by default.
+12 GB 4070 Ti easily runs gpt2, 1.5B, and 7B/8B in 4-bit. Smaller models are recommended for live watching.
 
 ## Related
 
